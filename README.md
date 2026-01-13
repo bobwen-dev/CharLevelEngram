@@ -200,7 +200,6 @@ If you are already using the original Engram in a tokenized setup, you can treat
 
 ---
 
-This section documents the **new, byte‑level, tokenizer‑free Engram implementation with Hugging Face support** and is intended to be read *before* the original Engram README to highlight what has been added/changed in this fork.
 
 
 
