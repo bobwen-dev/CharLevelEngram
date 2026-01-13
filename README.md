@@ -1,3 +1,213 @@
+# Update: Byte‑Level, Tokenizer‑Free Engram + Hugging Face Integration
+
+This update introduces a **byte‑level, tokenizer‑free implementation of Engram** that is fully integrated with the Hugging Face (`transformers`) ecosystem. You can prepend this section to the original Engram README to describe the new code and how to use it.
+
+---
+
+## What This Fork Adds
+
+This fork keeps the original **Engram idea**—a large static N‑gram memory table with **O(1) deterministic lookup** and **context‑aware gating**—but changes *where* N‑grams live and *how* the model is exposed:
+
+1. **No tokenizer required**
+   - The model works directly on **UTF‑8 bytes** (`0–255`), not BPE/WordPiece tokens.
+   - N‑grams are built over **bytes** instead of tokens (e.g., 3‑gram, 4‑gram byte windows).
+   - This avoids all tokenizer versioning / compatibility issues.
+
+2. **Byte‑level Engram module**
+   - For each position, the model takes the local byte N‑gram, hashes it, and uses the hash as an index into a **large trainable memory table**.
+   - The retrieved memory vector is fused with the Transformer hidden state via a **learned gate**:
+     \[
+     \text{gate} = \sigma(\text{MLP}([h, m])),\quad
+     h' = \text{gate}\cdot h + (1-\text{gate})\cdot m
+     \]
+   - This preserves the original Engram design: static pattern memory + dynamic, context‑aware usage.
+
+3. **Full Hugging Face compatibility**
+   - The model is implemented as a standard `PreTrainedModel` with a custom `PretrainedConfig`.
+   - You can:
+     - `save_pretrained` / `from_pretrained`
+     - register it with `AutoConfig` / `AutoModelForCausalLM`
+     - call `model.generate` as with any Causal LM
+   - A minimal **byte‑level tokenizer** (`ByteTokenizer`) is provided so you can plug the model into HF `pipeline("text-generation")` without any extra files.
+
+---
+
+## High‑Level Architecture
+
+The new implementation defines a byte‑level Causal LM with an Engram‑like memory block:
+
+1. **Config – `CharEngramConfig`**
+   - Inherits from `transformers.PretrainedConfig`.
+   - Key fields:
+     - `ngram_size`: byte N for N‑gram (e.g., 3 or 4)
+     - `memory_dim`: dimension of each memory vector
+     - `memory_capacity`: size of the memory table (number of hash buckets)
+     - `hidden_size`, `num_layers`, `max_seq_len`: Transformer backbone hyperparameters
+     - `engram_layer_index`: index of the layer after which the Engram module is inserted
+
+2. **Tokenizer – `ByteTokenizer` (virtual, tokenizer‑free)**
+   - Converts text to UTF‑8 bytes:
+     - `encode(text) -> List[int]  # values in [0, 255]`
+   - Converts byte IDs back to text:
+     - `decode(List[int]) -> str`
+   - `__call__` emulates HF tokenizers, returning:
+     - `input_ids: LongTensor[B, L]`
+     - `attention_mask: LongTensor[B, L]`
+
+3. **Backbone – byte‑level Transformer**
+   - `ByteEmbedding`: maps each byte (0–255) to an embedding and adds positional encoding.
+   - `CharTransformerBlock`: basic Transformer encoder block (multi‑head self‑attention + FFN + LayerNorm), using `[B, L, H]` layout.
+   - Stacks `num_layers` blocks; Engram is injected after `engram_layer_index`.
+
+4. **Engram‑like memory – byte N‑grams**
+   - `HashMapping`:
+     - Takes a contiguous byte N‑gram (e.g., 4 bytes), converts it to a **deterministic hash**, and maps it to `[0, memory_capacity)`.
+   - `ByteMemory`:
+     - A big trainable table: `memory_table[memory_capacity, memory_dim]`.
+     - For each position, computes the hash of the local N‑gram and returns the corresponding memory vector.
+   - `GateFusion`:
+     - Concatenates hidden state `h` and memory `m`, runs a small MLP + sigmoid to get a gate, and computes:
+       - `out = gate * h + (1 - gate) * m`
+     - Only the valid prefix (`L - ngram_size + 1`) is fused; the rest of the sequence is left unchanged.
+
+5. **Model – `CharLevelEngramModel`**
+   - Inherits `PreTrainedModel` and `GenerationMixin`.
+   - Forward:
+     - `input_ids` (bytes) → `ByteEmbedding` → Transformer layers
+     - After `engram_layer_index`, run `CharEngram` (memory lookup + gated fusion)
+     - Project final hidden states to 256‑dim byte vocabulary via `lm_head`
+   - Output:
+     - `logits: [B, L, vocab_size]` with `vocab_size = 256` (byte‑level LM)
+
+---
+
+## How to Use
+
+### 1. Basic usage
+
+```python
+from char_engram_modeling import CharEngramConfig, CharLevelEngramModel, ByteTokenizer
+import torch
+
+# 1) Instantiate config and model
+config = CharEngramConfig(
+    ngram_size=4,
+    hidden_size=256,
+    num_layers=4,
+    memory_capacity=100_000,
+    max_seq_len=128,
+)
+model = CharLevelEngramModel(config)
+
+# 2) Prepare input (no real tokenizer, just bytes)
+tokenizer = ByteTokenizer()
+batch = tokenizer("DeepSeek Engram is")
+
+input_ids = batch["input_ids"]        # [1, L]
+# (optionally move to GPU)
+# input_ids = input_ids.to("cuda")
+# model = model.to("cuda")
+
+# 3) Forward pass (logits over bytes)
+with torch.no_grad():
+    outputs = model(input_ids)
+logits = outputs.logits               # [1, L, 256]
+```
+
+### 2. Text generation (HF style)
+
+```python
+from char_engram_modeling import CharEngramConfig, CharLevelEngramModel, ByteTokenizer
+
+config = CharEngramConfig()
+model = CharLevelEngramModel(config)
+tokenizer = ByteTokenizer()
+
+prompt = "DeepSeek Engram is"
+inputs = tokenizer(prompt)
+
+with torch.no_grad():
+    generated = model.generate(
+        inputs["input_ids"],
+        max_new_tokens=64,
+        do_sample=True,
+        temperature=0.8,
+        top_k=50,
+        top_p=0.9,
+        pad_token_id=0,   # byte 0 is used as pad
+    )
+
+text = tokenizer.decode(generated[0].tolist())
+print(text)
+```
+
+### 3. Save and load with Hugging Face format
+
+```python
+from char_engram_modeling import CharEngramConfig, CharLevelEngramModel
+
+config = CharEngramConfig()
+model = CharLevelEngramModel(config)
+
+# Save in HF format
+model.save_pretrained("./char_engram_model")
+
+# Load later
+loaded_model = CharLevelEngramModel.from_pretrained("./char_engram_model")
+```
+
+### 4. Register with `AutoConfig` / `AutoModelForCausalLM`
+
+If you want to load the model via `AutoModelForCausalLM`:
+
+```python
+from transformers import AutoConfig, AutoModelForCausalLM
+from char_engram_modeling import CharEngramConfig, CharLevelEngramModel, ByteTokenizer
+
+# Register custom model type
+AutoConfig.register("char-engram", CharEngramConfig)
+AutoModelForCausalLM.register(CharEngramConfig, CharLevelEngramModel)
+
+# Load from local directory containing config + weights
+model = AutoModelForCausalLM.from_pretrained("./char_engram_model")
+tokenizer = ByteTokenizer()
+```
+
+---
+
+## When to Use This Version
+
+This byte‑level, tokenizer‑free Engram is useful when:
+
+- You want Engram‑style static memory but **do not want to depend on any tokenizer**.
+- You work with **mixed or noisy text** (logs, code, multilingual content) where sub‑word tokenizers are brittle.
+- You want a **minimal, fully self‑contained Engram example** that:
+  - can be trained end‑to‑end,
+  - and can be integrated with existing Hugging Face infrastructure.
+
+If you are already using the original Engram in a tokenized setup, you can treat this as an **alternative implementation** that demonstrates the same ideas (N‑gram memory + gated fusion) on a purely byte‑level architecture.
+
+---
+
+## Notes and Limitations
+
+- **Hash collisions**: Different byte N‑grams may map to the same memory slot. Use a sufficiently large `memory_capacity` to reduce harmful collisions.
+- **Byte‑level granularity**: All N‑grams are byte‑level, not semantic tokens. You may need:
+  - longer N‑grams,
+  - more training,
+  - or auxiliary objectives if you want the memory to align with higher‑level concepts.
+- **Simple tokenizer**: `ByteTokenizer` is intentionally minimal—no special tokens beyond using byte `0` as padding by default.
+
+---
+
+This section documents the **new, byte‑level, tokenizer‑free Engram implementation with Hugging Face support** and is intended to be read *before* the original Engram README to highlight what has been added/changed in this fork.
+
+
+
+
+
+
+
 <!-- markdownlint-disable first-line-h1 -->
 <!-- markdownlint-disable html -->
 <!-- markdownlint-disable no-duplicate-header -->
